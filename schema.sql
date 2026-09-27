@@ -47,3 +47,12 @@ CREATE TABLE IF NOT EXISTS contact_messages (
 
 -- Index for fast tracking lookups
 CREATE INDEX IF NOT EXISTS idx_shipments_tracking_number ON shipments(tracking_number);
+
+-- Chat Messages
+CREATE TABLE IF NOT EXISTS chat_messages (
+    id SERIAL PRIMARY KEY,
+    tracking_number VARCHAR(50) NOT NULL REFERENCES shipments(tracking_number) ON DELETE CASCADE,
+    sender VARCHAR(50) NOT NULL,
+    message TEXT NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);

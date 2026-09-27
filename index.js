@@ -4,12 +4,22 @@ import dotenv from 'dotenv';
 import pkg from 'pg';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import http from 'http';
+import { Server } from 'socket.io';
 
 dotenv.config();
 
 const { Pool } = pkg;
 const app = express();
 const port = process.env.PORT || 5000;
+
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: {
+    origin: '*',
+    methods: ['GET', 'POST']
+  }
+});
 
 // ─── DB Pool ──────────────────────────────────────────────────────────────────
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
@@ -283,7 +293,61 @@ app.get('/api/contact', authMiddleware, async (req, res) => {
   }
 });
 
+// Get all chat sessions (Admin)
+app.get('/api/chats', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT tracking_number, MAX(created_at) as last_msg FROM chat_messages GROUP BY tracking_number ORDER BY last_msg DESC');
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ─── Socket.IO ─────────────────────────────────────────────────────────────────
+io.on('connection', (socket) => {
+  console.log('🔌 Client connected:', socket.id);
+
+  socket.on('join_chat', async ({ tracking_number, isAdmin }) => {
+    try {
+      if (!isAdmin) {
+        // Verify tracking number exists
+        const result = await pool.query('SELECT id FROM shipments WHERE tracking_number ILIKE $1', [tracking_number]);
+        if (result.rows.length === 0) {
+          return socket.emit('chat_error', { message: 'Invalid tracking number' });
+        }
+      }
+      
+      socket.join(tracking_number);
+      console.log(`User joined chat for tracking number: ${tracking_number}`);
+
+      // Fetch chat history
+      const history = await pool.query('SELECT * FROM chat_messages WHERE tracking_number=$1 ORDER BY created_at ASC', [tracking_number]);
+      socket.emit('chat_history', history.rows);
+    } catch (err) {
+      console.error(err);
+      socket.emit('chat_error', { message: 'An internal error occurred. Please try again.' });
+    }
+  });
+
+  socket.on('send_message', async ({ tracking_number, sender, message }) => {
+    try {
+      const result = await pool.query(
+        'INSERT INTO chat_messages (tracking_number, sender, message) VALUES ($1, $2, $3) RETURNING *',
+        [tracking_number, sender, message]
+      );
+      io.to(tracking_number).emit('receive_message', result.rows[0]);
+    } catch (err) {
+      console.error(err);
+    }
+  });
+
+  socket.on('disconnect', () => {
+    console.log('🔌 Client disconnected:', socket.id);
+  });
+});
+
 // ─── Start Server ──────────────────────────────────────────────────────────────
-app.listen(port, () => {
+server.listen(port, () => {
   console.log(`🚀 Logistiqo API running on port ${port}`);
 });
