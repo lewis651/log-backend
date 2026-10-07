@@ -13,6 +13,16 @@ const { Pool } = pkg;
 const app = express();
 const port = process.env.PORT || 5000;
 
+// ─── Environment Verification ────────────────────────────────────────────────
+if (!process.env.DATABASE_URL) {
+  console.error('❌ FATAL: DATABASE_URL is missing in environment variables.');
+  process.exit(1);
+}
+if (!process.env.JWT_SECRET) {
+  console.error('❌ FATAL: JWT_SECRET is missing in environment variables.');
+  process.exit(1);
+}
+
 // ─── Dynamic Allowed Origins (Fixes CORS "Failed to fetch") ───────────────────
 const allowedOrigins = [
   'https://logistiqo.site',
@@ -23,7 +33,7 @@ const allowedOrigins = [
 ].filter(Boolean);
 
 const isAllowedOrigin = (origin) => {
-  if (!origin) return true; // Allow non-browser requests (Postman, curl)
+  if (!origin) return true; // Allow non-browser requests (Postman, curl, server-to-server)
   return (
     allowedOrigins.includes(origin) ||
     origin.endsWith('.vercel.app') ||
@@ -54,7 +64,7 @@ const pool = new Pool({
 });
 
 pool.on('connect', () => console.log('✅ Connected to Neon PostgreSQL'));
-pool.on('error', (err) => { console.error('DB error:', err); });
+pool.on('error', (err) => { console.error('DB error:', err.message || err); });
 
 // ─── Express Middleware ────────────────────────────────────────────────────────
 app.use(cors({
@@ -76,7 +86,7 @@ app.use(express.json());
 const authMiddleware = (req, res, next) => {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Unauthorized' });
+    return res.status(401).json({ error: 'Unauthorized: Missing or invalid token format' });
   }
   const token = authHeader.split(' ')[1];
   try {
@@ -84,37 +94,45 @@ const authMiddleware = (req, res, next) => {
     req.admin = decoded;
     next();
   } catch {
-    return res.status(401).json({ error: 'Invalid or expired token' });
+    return res.status(401).json({ error: 'Invalid or expired authentication token' });
   }
 };
 
-// ─── Health ────────────────────────────────────────────────────────────────────
-app.get('/api/health', async (req, res) => {
+// ─── Health Route ──────────────────────────────────────────────────────────────
+app.get('/api/health', async (_req, res) => {
   try {
     await pool.query('SELECT 1');
     res.json({ status: 'OK', message: 'Logistiqo API is running', database: 'connected' });
   } catch (err) {
+    console.error('Health check failed:', err.message);
     res.status(503).json({ status: 'ERROR', message: 'Database connection failed' });
   }
 });
 
 // ─── Admin Auth ────────────────────────────────────────────────────────────────
-// Seed admin (run once)
+// Seed admin (run once or to reset admin credentials)
 app.post('/api/admin/seed', async (req, res) => {
   try {
     const { username, password, secret } = req.body;
-    if (secret !== process.env.SEED_SECRET) {
-      return res.status(403).json({ error: 'Forbidden' });
+    if (!secret || secret !== process.env.SEED_SECRET) {
+      return res.status(403).json({ error: 'Forbidden: Invalid seed secret' });
     }
+    if (!username || !password) {
+      return res.status(400).json({ error: 'Username and password are required' });
+    }
+
     const hash = await bcrypt.hash(password, 12);
     await pool.query(
-      'INSERT INTO admins (username, password_hash) VALUES ($1, $2) ON CONFLICT (username) DO UPDATE SET password_hash=$2',
-      [username, hash]
+      `INSERT INTO admins (username, password_hash) 
+       VALUES ($1, $2) 
+       ON CONFLICT (username) DO UPDATE SET password_hash = $2`,
+      [username.trim(), hash]
     );
-    res.json({ message: 'Admin seeded successfully' });
+
+    res.json({ message: 'Admin account seeded successfully' });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Server error' });
+    console.error('Admin seed error:', err);
+    res.status(500).json({ error: 'Server error during seeding' });
   }
 });
 
@@ -125,23 +143,40 @@ app.post('/api/admin/login', async (req, res) => {
     if (!username || !password) {
       return res.status(400).json({ error: 'Username and password are required' });
     }
-    const result = await pool.query('SELECT * FROM admins WHERE username=$1', [username]);
+
+    const cleanUsername = username.trim();
+    const result = await pool.query(
+      'SELECT * FROM admins WHERE LOWER(username) = LOWER($1)',
+      [cleanUsername]
+    );
+
     if (result.rows.length === 0) {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
+
     const admin = result.rows[0];
+
+    // Safe check: handle unseeded or non-string password hashes in DB
+    if (!admin.password_hash || typeof admin.password_hash !== 'string') {
+      console.error(`Admin user ${cleanUsername} has invalid password_hash in database.`);
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
     const valid = await bcrypt.compare(password, admin.password_hash);
-    if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
+    if (!valid) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
 
     const token = jwt.sign(
       { id: admin.id, username: admin.username },
       process.env.JWT_SECRET,
       { expiresIn: '8h' }
     );
+
     res.json({ token, admin: { id: admin.id, username: admin.username } });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Server error' });
+    console.error('Login error:', err);
+    res.status(500).json({ error: 'Internal server error during login' });
   }
 });
 
@@ -156,11 +191,11 @@ app.post('/api/shipments', authMiddleware, async (req, res) => {
       weight, description, package_type
     } = req.body;
 
-    if (!tracking_number || !start_location || !end_location || !total_hours || !start_lat || !start_lng || !end_lat || !end_lng) {
-      return res.status(400).json({ error: 'Missing required fields' });
+    if (!tracking_number || !start_location || !end_location || !total_hours || start_lat == null || start_lng == null || end_lat == null || end_lng == null) {
+      return res.status(400).json({ error: 'Missing required shipment fields' });
     }
 
-    const expected_delivery = new Date(Date.now() + total_hours * 3600 * 1000);
+    const expected_delivery = new Date(Date.now() + Number(total_hours) * 3600 * 1000);
 
     const result = await pool.query(
       `INSERT INTO shipments 
@@ -173,22 +208,25 @@ app.post('/api/shipments', authMiddleware, async (req, res) => {
        start_location, end_location, start_lat, start_lng, end_lat, end_lng,
        total_hours, weight, description, package_type, expected_delivery]
     );
+
     res.status(201).json(result.rows[0]);
   } catch (err) {
-    console.error(err);
-    if (err.code === '23505') return res.status(409).json({ error: 'Tracking number already exists' });
-    res.status(500).json({ error: 'Server error' });
+    console.error('Create shipment error:', err);
+    if (err.code === '23505') {
+      return res.status(409).json({ error: 'Tracking number already exists' });
+    }
+    res.status(500).json({ error: 'Server error creating shipment' });
   }
 });
 
 // Get all shipments (Admin)
-app.get('/api/shipments', authMiddleware, async (req, res) => {
+app.get('/api/shipments', authMiddleware, async (_req, res) => {
   try {
     const result = await pool.query('SELECT * FROM shipments ORDER BY created_at DESC');
     res.json(result.rows);
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Server error' });
+    console.error('Fetch shipments error:', err);
+    res.status(500).json({ error: 'Server error fetching shipments' });
   }
 });
 
@@ -199,7 +237,9 @@ app.put('/api/shipments/:tracking_number', authMiddleware, async (req, res) => {
     const { is_paused, elapsed_hours, status } = req.body;
 
     const currentRes = await pool.query('SELECT * FROM shipments WHERE tracking_number=$1', [tracking_number]);
-    if (currentRes.rows.length === 0) return res.status(404).json({ error: 'Shipment not found' });
+    if (currentRes.rows.length === 0) {
+      return res.status(404).json({ error: 'Shipment not found' });
+    }
     const s = currentRes.rows[0];
 
     let query = 'UPDATE shipments SET updated_at=NOW()';
@@ -209,7 +249,7 @@ app.put('/api/shipments/:tracking_number', authMiddleware, async (req, res) => {
     if (is_paused !== undefined) {
       query += `, is_paused=$${i++}`;
       params.push(is_paused);
-      
+
       if (is_paused && !s.is_paused) {
         query += `, pause_started_at=NOW()`;
       } else if (!is_paused && s.is_paused && s.pause_started_at) {
@@ -218,7 +258,7 @@ app.put('/api/shipments/:tracking_number', authMiddleware, async (req, res) => {
         query += `, pause_started_at = NULL`;
       }
     }
-    
+
     if (elapsed_hours !== undefined) {
       query += `, elapsed_hours=$${i++}`;
       params.push(elapsed_hours);
@@ -234,8 +274,8 @@ app.put('/api/shipments/:tracking_number', authMiddleware, async (req, res) => {
     const result = await pool.query(query, params);
     res.json(result.rows[0]);
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Server error' });
+    console.error('Update shipment error:', err);
+    res.status(500).json({ error: 'Server error updating shipment' });
   }
 });
 
@@ -243,11 +283,14 @@ app.put('/api/shipments/:tracking_number', authMiddleware, async (req, res) => {
 app.delete('/api/shipments/:tracking_number', authMiddleware, async (req, res) => {
   try {
     const { tracking_number } = req.params;
-    await pool.query('DELETE FROM shipments WHERE tracking_number=$1', [tracking_number]);
-    res.json({ message: 'Shipment deleted' });
+    const result = await pool.query('DELETE FROM shipments WHERE tracking_number=$1 RETURNING tracking_number', [tracking_number]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Shipment not found' });
+    }
+    res.json({ message: 'Shipment deleted successfully' });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Server error' });
+    console.error('Delete shipment error:', err);
+    res.status(500).json({ error: 'Server error deleting shipment' });
   }
 });
 
@@ -256,22 +299,23 @@ app.get('/api/track/:tracking_number', async (req, res) => {
   try {
     const { tracking_number } = req.params;
     const result = await pool.query(
-      'SELECT * FROM shipments WHERE tracking_number=$1',
-      [tracking_number.toUpperCase()]
+      'SELECT * FROM shipments WHERE LOWER(tracking_number) = LOWER($1)',
+      [tracking_number.trim()]
     );
+
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Tracking number not found' });
     }
-    const s = result.rows[0];
 
+    const s = result.rows[0];
     const now = Date.now();
     const startedAt = new Date(s.started_at).getTime();
     const totalMs = parseFloat(s.total_hours) * 3600 * 1000;
     const elapsedMs = s.is_paused
-      ? parseFloat(s.elapsed_hours) * 3600 * 1000
+      ? parseFloat(s.elapsed_hours || 0) * 3600 * 1000
       : Math.min(now - startedAt, totalMs);
 
-    let progress = Math.min(elapsedMs / totalMs, 1);
+    let progress = Math.min(Math.max(elapsedMs / totalMs, 0), 1);
     if (s.status === 'Delivered') progress = 1;
 
     const currentLat = parseFloat(s.start_lat) + (parseFloat(s.end_lat) - parseFloat(s.start_lat)) * progress;
@@ -302,8 +346,8 @@ app.get('/api/track/:tracking_number', async (req, res) => {
       created_at: s.created_at,
     });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Server error' });
+    console.error('Tracking query error:', err);
+    res.status(500).json({ error: 'Server error retrieving tracking info' });
   }
 });
 
@@ -320,66 +364,78 @@ app.post('/api/contact', async (req, res) => {
     );
     res.json({ message: 'Message received. We will be in touch shortly.' });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Server error' });
+    console.error('Contact submit error:', err);
+    res.status(500).json({ error: 'Server error submitting message' });
   }
 });
 
 // Get all contact messages (Admin)
-app.get('/api/contact', authMiddleware, async (req, res) => {
+app.get('/api/contact', authMiddleware, async (_req, res) => {
   try {
     const result = await pool.query('SELECT * FROM contact_messages ORDER BY created_at DESC');
     res.json(result.rows);
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Server error' });
+    console.error('Fetch contact messages error:', err);
+    res.status(500).json({ error: 'Server error fetching contact messages' });
   }
 });
 
 // Get all chat sessions (Admin)
-app.get('/api/chats', authMiddleware, async (req, res) => {
+app.get('/api/chats', authMiddleware, async (_req, res) => {
   try {
-    const result = await pool.query('SELECT tracking_number, MAX(created_at) as last_msg FROM chat_messages GROUP BY tracking_number ORDER BY last_msg DESC');
+    const result = await pool.query(
+      'SELECT tracking_number, MAX(created_at) AS last_msg FROM chat_messages GROUP BY tracking_number ORDER BY last_msg DESC'
+    );
     res.json(result.rows);
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Server error' });
+    console.error('Fetch chats error:', err);
+    res.status(500).json({ error: 'Server error fetching chat sessions' });
   }
 });
 
-// ─── Socket.IO ─────────────────────────────────────────────────────────────────
+// ─── Socket.IO Real-time Messaging ─────────────────────────────────────────────
 io.on('connection', (socket) => {
   console.log('🔌 Client connected:', socket.id);
 
   socket.on('join_chat', async ({ tracking_number, isAdmin }) => {
     try {
+      if (!tracking_number) return;
+
       if (!isAdmin) {
-        const result = await pool.query('SELECT id FROM shipments WHERE tracking_number ILIKE $1', [tracking_number]);
+        const result = await pool.query(
+          'SELECT id FROM shipments WHERE LOWER(tracking_number) = LOWER($1)',
+          [tracking_number.trim()]
+        );
         if (result.rows.length === 0) {
           return socket.emit('chat_error', { message: 'Invalid tracking number' });
         }
       }
-      
-      socket.join(tracking_number);
-      console.log(`User joined chat for tracking number: ${tracking_number}`);
 
-      const history = await pool.query('SELECT * FROM chat_messages WHERE tracking_number=$1 ORDER BY created_at ASC', [tracking_number]);
+      socket.join(tracking_number);
+      console.log(`User joined chat room: ${tracking_number}`);
+
+      const history = await pool.query(
+        'SELECT * FROM chat_messages WHERE LOWER(tracking_number) = LOWER($1) ORDER BY created_at ASC',
+        [tracking_number.trim()]
+      );
       socket.emit('chat_history', history.rows);
     } catch (err) {
-      console.error(err);
-      socket.emit('chat_error', { message: 'An internal error occurred. Please try again.' });
+      console.error('Socket join_chat error:', err);
+      socket.emit('chat_error', { message: 'Failed to load chat history' });
     }
   });
 
   socket.on('send_message', async ({ tracking_number, sender, message }) => {
     try {
+      if (!tracking_number || !message) return;
+
       const result = await pool.query(
         'INSERT INTO chat_messages (tracking_number, sender, message) VALUES ($1, $2, $3) RETURNING *',
-        [tracking_number, sender, message]
+        [tracking_number, sender || 'user', message]
       );
       io.to(tracking_number).emit('receive_message', result.rows[0]);
     } catch (err) {
-      console.error(err);
+      console.error('Socket send_message error:', err);
     }
   });
 
