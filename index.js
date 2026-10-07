@@ -13,22 +13,63 @@ const { Pool } = pkg;
 const app = express();
 const port = process.env.PORT || 5000;
 
+// ─── Dynamic Allowed Origins (Fixes CORS "Failed to fetch") ───────────────────
+const allowedOrigins = [
+  'https://logistiqo.site',
+  'https://www.logistiqo.site',
+  (process.env.FRONTEND_ORIGIN || '').replace(/\/+$/, '').trim(),
+  'http://localhost:5173',
+  'http://localhost:3000'
+].filter(Boolean);
+
+const isAllowedOrigin = (origin) => {
+  if (!origin) return true; // Allow non-browser requests (Postman, curl)
+  return (
+    allowedOrigins.includes(origin) ||
+    origin.endsWith('.vercel.app') ||
+    origin.endsWith('.logistiqo.site')
+  );
+};
+
+// ─── HTTP & Socket.IO Setup ──────────────────────────────────────────────────
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: '*',
-    methods: ['GET', 'POST']
+    origin: (origin, callback) => {
+      if (isAllowedOrigin(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error(`Socket.IO CORS blocked for origin: ${origin}`));
+      }
+    },
+    methods: ['GET', 'POST'],
+    credentials: true
   }
 });
 
 // ─── DB Pool ──────────────────────────────────────────────────────────────────
-const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL?.includes('localhost') ? false : { rejectUnauthorized: false }
+});
 
 pool.on('connect', () => console.log('✅ Connected to Neon PostgreSQL'));
-pool.on('error', (err) => { console.error('DB error', err); process.exit(-1); });
+pool.on('error', (err) => { console.error('DB error:', err); });
 
-// ─── Middleware ────────────────────────────────────────────────────────────────
-app.use(cors());
+// ─── Express Middleware ────────────────────────────────────────────────────────
+app.use(cors({
+  origin: (origin, callback) => {
+    if (isAllowedOrigin(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error(`CORS policy violation for origin: ${origin}`));
+    }
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
+
 app.use(express.json());
 
 // ─── Auth Middleware ───────────────────────────────────────────────────────────
@@ -43,13 +84,18 @@ const authMiddleware = (req, res, next) => {
     req.admin = decoded;
     next();
   } catch {
-    return res.status(401).json({ error: 'Invalid token' });
+    return res.status(401).json({ error: 'Invalid or expired token' });
   }
 };
 
 // ─── Health ────────────────────────────────────────────────────────────────────
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'OK', message: 'Logistiqo API is running' });
+app.get('/api/health', async (req, res) => {
+  try {
+    await pool.query('SELECT 1');
+    res.json({ status: 'OK', message: 'Logistiqo API is running', database: 'connected' });
+  } catch (err) {
+    res.status(503).json({ status: 'ERROR', message: 'Database connection failed' });
+  }
 });
 
 // ─── Admin Auth ────────────────────────────────────────────────────────────────
@@ -165,10 +211,8 @@ app.put('/api/shipments/:tracking_number', authMiddleware, async (req, res) => {
       params.push(is_paused);
       
       if (is_paused && !s.is_paused) {
-        // Pausing
         query += `, pause_started_at=NOW()`;
       } else if (!is_paused && s.is_paused && s.pause_started_at) {
-        // Resuming
         query += `, started_at = started_at + (NOW() - pause_started_at)`;
         query += `, expected_delivery = expected_delivery + (NOW() - pause_started_at)`;
         query += `, pause_started_at = NULL`;
@@ -220,7 +264,6 @@ app.get('/api/track/:tracking_number', async (req, res) => {
     }
     const s = result.rows[0];
 
-    // Compute current position by interpolating based on elapsed time
     const now = Date.now();
     const startedAt = new Date(s.started_at).getTime();
     const totalMs = parseFloat(s.total_hours) * 3600 * 1000;
@@ -311,7 +354,6 @@ io.on('connection', (socket) => {
   socket.on('join_chat', async ({ tracking_number, isAdmin }) => {
     try {
       if (!isAdmin) {
-        // Verify tracking number exists
         const result = await pool.query('SELECT id FROM shipments WHERE tracking_number ILIKE $1', [tracking_number]);
         if (result.rows.length === 0) {
           return socket.emit('chat_error', { message: 'Invalid tracking number' });
@@ -321,7 +363,6 @@ io.on('connection', (socket) => {
       socket.join(tracking_number);
       console.log(`User joined chat for tracking number: ${tracking_number}`);
 
-      // Fetch chat history
       const history = await pool.query('SELECT * FROM chat_messages WHERE tracking_number=$1 ORDER BY created_at ASC', [tracking_number]);
       socket.emit('chat_history', history.rows);
     } catch (err) {
