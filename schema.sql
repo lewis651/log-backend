@@ -14,6 +14,8 @@ CREATE TABLE IF NOT EXISTS shipments (
     sender_address TEXT,
     receiver_name VARCHAR(255),
     receiver_address TEXT,
+    receiver_email VARCHAR(255),
+    product_image TEXT,
     start_location VARCHAR(255) NOT NULL,
     end_location VARCHAR(255) NOT NULL,
     start_lat DECIMAL(10, 8) NOT NULL,
@@ -56,3 +58,7 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     message TEXT NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Migrations for existing deployments
+ALTER TABLE shipments ADD COLUMN IF NOT EXISTS receiver_email VARCHAR(255);
+ALTER TABLE shipments ADD COLUMN IF NOT EXISTS product_image TEXT;

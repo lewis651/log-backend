@@ -6,8 +6,48 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import http from 'http';
 import { Server } from 'socket.io';
+import path from 'path';
+import fs from 'fs';
+import { fileURLToPath } from 'url';
+import multer from 'multer';
+import { sendTrackingEmail } from './email.js';
 
 dotenv.config();
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Ensure uploads folder exists
+const uploadsDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadsDir)) {
+  fs.mkdirSync(uploadsDir, { recursive: true });
+}
+
+// Multer storage setup for product images
+const storage = multer.diskStorage({
+  destination: (_req, _file, cb) => {
+    cb(null, uploadsDir);
+  },
+  filename: (_req, file, cb) => {
+    const ext = path.extname(file.originalname).toLowerCase();
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
+    cb(null, `product-${uniqueSuffix}${ext}`);
+  }
+});
+
+const upload = multer({
+  storage,
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB max
+  fileFilter: (_req, file, cb) => {
+    const allowed = /jpeg|jpg|png|webp|gif|svg/;
+    const extname = allowed.test(path.extname(file.originalname).toLowerCase());
+    const mimetype = allowed.test(file.mimetype);
+    if (extname && mimetype) {
+      return cb(null, true);
+    }
+    cb(new Error('Only image files (JPG, PNG, WEBP, GIF, SVG) are allowed!'));
+  }
+});
 
 const { Pool } = pkg;
 const app = express();
@@ -80,7 +120,9 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+app.use('/uploads', express.static(uploadsDir));
 
 // ─── Auth Middleware ───────────────────────────────────────────────────────────
 const authMiddleware = (req, res, next) => {
@@ -180,13 +222,33 @@ app.post('/api/admin/login', async (req, res) => {
   }
 });
 
+// ─── File Upload (Admin) ───────────────────────────────────────────────────────
+app.post('/api/upload', authMiddleware, (req, res) => {
+  upload.single('image')(req, res, (err) => {
+    if (err instanceof multer.MulterError) {
+      if (err.code === 'LIMIT_FILE_SIZE') {
+        return res.status(400).json({ error: 'File size too large. Maximum size is 10MB.' });
+      }
+      return res.status(400).json({ error: `Upload error: ${err.message}` });
+    } else if (err) {
+      return res.status(400).json({ error: err.message || 'File upload failed' });
+    }
+    if (!req.file) {
+      return res.status(400).json({ error: 'No image file uploaded' });
+    }
+    const imageUrl = `/uploads/${req.file.filename}`;
+    res.json({ imageUrl, filename: req.file.filename });
+  });
+});
+
 // ─── Shipments (Admin) ────────────────────────────────────────────────────────
 // Create shipment
 app.post('/api/shipments', authMiddleware, async (req, res) => {
   try {
     const {
       tracking_number, sender_name, sender_address,
-      receiver_name, receiver_address, start_location, end_location,
+      receiver_name, receiver_address, receiver_email, product_image,
+      start_location, end_location,
       start_lat, start_lng, end_lat, end_lng, total_hours,
       weight, description, package_type
     } = req.body;
@@ -200,16 +262,38 @@ app.post('/api/shipments', authMiddleware, async (req, res) => {
     const result = await pool.query(
       `INSERT INTO shipments 
         (tracking_number, sender_name, sender_address, receiver_name, receiver_address,
+         receiver_email, product_image,
          start_location, end_location, start_lat, start_lng, end_lat, end_lng,
          total_hours, weight, description, package_type, status, started_at, expected_delivery)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'In Transit',NOW(),$16)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,'In Transit',NOW(),$18)
        RETURNING *`,
       [tracking_number, sender_name, sender_address, receiver_name, receiver_address,
+       receiver_email ? receiver_email.trim() : null, product_image || null,
        start_location, end_location, start_lat, start_lng, end_lat, end_lng,
        total_hours, weight, description, package_type, expected_delivery]
     );
 
-    res.status(201).json(result.rows[0]);
+    const shipment = result.rows[0];
+
+    // Trigger email notification if recipient email is provided
+    if (receiver_email && receiver_email.trim()) {
+      sendTrackingEmail({
+        to: receiver_email.trim(),
+        receiver_name,
+        tracking_number,
+        start_location,
+        end_location,
+        expected_delivery,
+        product_image,
+        package_type,
+        weight,
+        description
+      }).catch(emailErr => {
+        console.error('Failed to send tracking email:', emailErr.message || emailErr);
+      });
+    }
+
+    res.status(201).json(shipment);
   } catch (err) {
     console.error('Create shipment error:', err);
     if (err.code === '23505') {
@@ -234,7 +318,7 @@ app.get('/api/shipments', authMiddleware, async (_req, res) => {
 app.put('/api/shipments/:tracking_number', authMiddleware, async (req, res) => {
   try {
     const { tracking_number } = req.params;
-    const { is_paused, elapsed_hours, status } = req.body;
+    const { is_paused, elapsed_hours, status, receiver_email, product_image } = req.body;
 
     const currentRes = await pool.query('SELECT * FROM shipments WHERE tracking_number=$1', [tracking_number]);
     if (currentRes.rows.length === 0) {
@@ -266,6 +350,14 @@ app.put('/api/shipments/:tracking_number', authMiddleware, async (req, res) => {
     if (status !== undefined) {
       query += `, status=$${i++}`;
       params.push(status);
+    }
+    if (receiver_email !== undefined) {
+      query += `, receiver_email=$${i++}`;
+      params.push(receiver_email ? receiver_email.trim() : null);
+    }
+    if (product_image !== undefined) {
+      query += `, product_image=$${i++}`;
+      params.push(product_image);
     }
 
     query += ` WHERE tracking_number=$${i} RETURNING *`;
@@ -327,6 +419,8 @@ app.get('/api/track/:tracking_number', async (req, res) => {
       sender_address: s.sender_address,
       receiver_name: s.receiver_name,
       receiver_address: s.receiver_address,
+      receiver_email: s.receiver_email,
+      product_image: s.product_image,
       start_location: s.start_location,
       end_location: s.end_location,
       weight: s.weight,
