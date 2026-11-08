@@ -200,7 +200,7 @@ Logistiqo Logistics Team
       const resend = new Resend(process.env.RESEND_API_KEY);
       const resendFrom =
         process.env.EMAIL_FROM ||
-        'Logistiqo Logistics <onboarding@resend.dev>';
+        'Logistiqo Logistics <notifications@logistiqo.site>';
 
       const res = await resend.emails.send({
         from: resendFrom,
@@ -212,6 +212,7 @@ Logistiqo Logistics Team
         headers: {
           'X-Mailer': 'Logistiqo Logistics Notification System',
           'Auto-Submitted': 'auto-generated',
+          'List-Unsubscribe': `<mailto:${replyToAddress}?subject=unsubscribe>`,
         }
       });
 
