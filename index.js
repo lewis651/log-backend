@@ -6,46 +6,39 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import http from 'http';
 import { Server } from 'socket.io';
-import path from 'path';
-import fs from 'fs';
-import { fileURLToPath } from 'url';
 import multer from 'multer';
+import { v2 as cloudinary } from 'cloudinary';
+import { CloudinaryStorage } from 'multer-storage-cloudinary';
 import { sendTrackingEmail } from './email.js';
 
 dotenv.config();
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+// ─── Cloudinary Configuration ─────────────────────────────────────────────────
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key:    process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+});
 
-// Ensure uploads folder exists
-const uploadsDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir, { recursive: true });
-}
-
-// Multer storage setup for product images
-const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => {
-    cb(null, uploadsDir);
+// Multer → Cloudinary storage (images go straight to CDN)
+const storage = new CloudinaryStorage({
+  cloudinary,
+  params: {
+    folder: 'logistiqo-products',
+    allowed_formats: ['jpg', 'jpeg', 'png', 'webp', 'gif'],
+    transformation: [{ width: 1200, crop: 'limit', quality: 'auto' }],
   },
-  filename: (_req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase();
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
-    cb(null, `product-${uniqueSuffix}${ext}`);
-  }
 });
 
 const upload = multer({
   storage,
   limits: { fileSize: 10 * 1024 * 1024 }, // 10MB max
   fileFilter: (_req, file, cb) => {
-    const allowed = /jpeg|jpg|png|webp|gif|svg/;
-    const extname = allowed.test(path.extname(file.originalname).toLowerCase());
+    const allowed = /jpeg|jpg|png|webp|gif/;
+    const extname = allowed.test(file.originalname.toLowerCase().split('.').pop());
     const mimetype = allowed.test(file.mimetype);
-    if (extname && mimetype) {
-      return cb(null, true);
-    }
-    cb(new Error('Only image files (JPG, PNG, WEBP, GIF, SVG) are allowed!'));
+    if (extname && mimetype) return cb(null, true);
+    cb(new Error('Only image files (JPG, PNG, WEBP, GIF) are allowed!'));
   }
 });
 
@@ -122,7 +115,7 @@ app.use(cors({
 
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
-app.use('/uploads', express.static(uploadsDir));
+
 
 // ─── Auth Middleware ───────────────────────────────────────────────────────────
 const authMiddleware = (req, res, next) => {
@@ -236,7 +229,8 @@ app.post('/api/upload', authMiddleware, (req, res) => {
     if (!req.file) {
       return res.status(400).json({ error: 'No image file uploaded' });
     }
-    const imageUrl = `/uploads/${req.file.filename}`;
+    // Cloudinary stores the full CDN URL in req.file.path
+    const imageUrl = req.file.path;
     res.json({ imageUrl, filename: req.file.filename });
   });
 });
