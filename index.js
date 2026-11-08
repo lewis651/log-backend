@@ -8,7 +8,6 @@ import http from 'http';
 import { Server } from 'socket.io';
 import multer from 'multer';
 import { v2 as cloudinary } from 'cloudinary';
-import { CloudinaryStorage } from 'multer-storage-cloudinary';
 import { sendTrackingEmail } from './email.js';
 
 dotenv.config();
@@ -20,18 +19,10 @@ cloudinary.config({
   api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
-// Multer → Cloudinary storage (images go straight to CDN)
-const storage = new CloudinaryStorage({
-  cloudinary,
-  params: {
-    folder: 'logistiqo-products',
-    allowed_formats: ['jpg', 'jpeg', 'png', 'webp', 'gif'],
-    transformation: [{ width: 1200, crop: 'limit', quality: 'auto' }],
-  },
-});
-
+// Use memory storage — file bytes are held in RAM then streamed to Cloudinary.
+// This avoids multer-storage-cloudinary which is not compatible with multer v2.
 const upload = multer({
-  storage,
+  storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024 }, // 10MB max
   fileFilter: (_req, file, cb) => {
     const allowed = /jpeg|jpg|png|webp|gif/;
@@ -41,6 +32,19 @@ const upload = multer({
     cb(new Error('Only image files (JPG, PNG, WEBP, GIF) are allowed!'));
   }
 });
+
+// Helper: upload a buffer to Cloudinary and return the secure URL
+const uploadToCloudinary = (buffer, mimetype) =>
+  new Promise((resolve, reject) => {
+    const stream = cloudinary.uploader.upload_stream(
+      { folder: 'logistiqo-products', resource_type: 'image' },
+      (error, result) => {
+        if (error) return reject(error);
+        resolve(result.secure_url);
+      }
+    );
+    stream.end(buffer);
+  });
 
 const { Pool } = pkg;
 const app = express();
@@ -217,21 +221,25 @@ app.post('/api/admin/login', async (req, res) => {
 
 // ─── File Upload (Admin) ───────────────────────────────────────────────────────
 app.post('/api/upload', authMiddleware, (req, res) => {
-  upload.single('image')(req, res, (err) => {
+  upload.single('image')(req, res, async (err) => {
     if (err instanceof multer.MulterError) {
       if (err.code === 'LIMIT_FILE_SIZE') {
-        return res.status(400).json({ error: 'File size too large. Maximum size is 10MB.' });
+        return res.status(400).json({ error: 'File too large. Maximum size is 10MB.' });
       }
       return res.status(400).json({ error: `Upload error: ${err.message}` });
     } else if (err) {
       return res.status(400).json({ error: err.message || 'File upload failed' });
     }
     if (!req.file) {
-      return res.status(400).json({ error: 'No image file uploaded' });
+      return res.status(400).json({ error: 'No image file provided' });
     }
-    // Cloudinary stores the full CDN URL in req.file.path
-    const imageUrl = req.file.path;
-    res.json({ imageUrl, filename: req.file.filename });
+    try {
+      const imageUrl = await uploadToCloudinary(req.file.buffer, req.file.mimetype);
+      res.json({ imageUrl, filename: imageUrl.split('/').pop() });
+    } catch (uploadErr) {
+      console.error('Cloudinary upload error:', uploadErr.message || uploadErr);
+      res.status(500).json({ error: 'Image upload to cloud storage failed' });
+    }
   });
 });
 
